@@ -36,14 +36,14 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
         })
 
         .def("get_nn_input", [](const GameState& gs) {
-            py::array_t<float> arr({TOTAL_PLANES, 8, 8});
+            py::array_t<float> arr(std::vector<ssize_t>{TOTAL_PLANES, 8, 8});
             auto buf = arr.mutable_data();
             gs.get_nn_input(buf);
             return arr;
         })
 
         .def("get_legal_move_mask", [](const GameState& gs) {
-            py::array_t<float> arr({POLICY_SIZE});
+            py::array_t<float> arr(std::vector<ssize_t>{POLICY_SIZE});
             auto buf = arr.mutable_data();
             gs.get_legal_move_mask(buf);
             return arr;
@@ -96,8 +96,8 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
             py::array_t<float> py_masks;
 
             if (n > 0) {
-                py_inputs = py::array_t<float>({n, TOTAL_PLANES, 8, 8});
-                py_masks = py::array_t<float>({n, POLICY_SIZE});
+                py_inputs = py::array_t<float>(std::vector<ssize_t>{n, TOTAL_PLANES, 8, 8});
+                py_masks = py::array_t<float>(std::vector<ssize_t>{n, (ssize_t)POLICY_SIZE});
                 auto inp_buf = py_inputs.mutable_data();
                 auto mask_buf = py_masks.mutable_data();
                 for (int i = 0; i < n; i++) {
@@ -105,8 +105,8 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
                     std::memcpy(mask_buf + i * POLICY_SIZE, masks[i].data(), POLICY_SIZE * sizeof(float));
                 }
             } else {
-                py_inputs = py::array_t<float>({0, TOTAL_PLANES, 8, 8});
-                py_masks = py::array_t<float>({0, POLICY_SIZE});
+                py_inputs = py::array_t<float>(std::vector<ssize_t>{0, TOTAL_PLANES, 8, 8});
+                py_masks = py::array_t<float>(std::vector<ssize_t>{0, (ssize_t)POLICY_SIZE});
             }
 
             return py::make_tuple(py_inputs, py_masks,
@@ -130,7 +130,7 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
         })
 
         .def("get_policy_target", [](MCTS& mcts, float temperature) {
-            py::array_t<float> arr({POLICY_SIZE});
+            py::array_t<float> arr(std::vector<ssize_t>{POLICY_SIZE});
             auto buf = arr.mutable_data();
             mcts.get_policy_target(buf, temperature);
             return arr;
