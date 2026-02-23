@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--lr", type=float, default=0.02)
     parser.add_argument("--res-blocks", type=int, default=10)
     parser.add_argument("--filters", type=int, default=128)
+    parser.add_argument("--parallel-games", type=int, default=64)
+    parser.add_argument("--mcts-batch-size", type=int, default=16)
     parser.add_argument("--arena-games", type=int, default=40)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
@@ -28,6 +30,8 @@ def main():
         learning_rate=args.lr,
         num_res_blocks=args.res_blocks,
         num_filters=args.filters,
+        num_parallel_games=args.parallel_games,
+        mcts_batch_size=args.mcts_batch_size,
         arena_games=args.arena_games,
         checkpoint_dir=args.checkpoint_dir,
     )
