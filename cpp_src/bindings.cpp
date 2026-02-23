@@ -89,7 +89,10 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
             std::vector<int> terminal_indices;
             std::vector<float> terminal_values;
 
-            mcts.get_leaf_batch(inputs, masks, terminal_indices, terminal_values);
+            {
+                py::gil_scoped_release release;
+                mcts.get_leaf_batch(inputs, masks, terminal_indices, terminal_values);
+            }
 
             int n = (int)inputs.size();
             py::array_t<float> py_inputs;
@@ -126,6 +129,8 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
             for (int i = 0; i < n; i++) {
                 std::memcpy(pols[i].data(), p_buf + i * POLICY_SIZE, POLICY_SIZE * sizeof(float));
             }
+
+            py::gil_scoped_release release;
             mcts.provide_evaluations(vals, pols);
         })
 
@@ -163,7 +168,12 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
             std::vector<int> game_ids;
             std::vector<int> batch_counts;
 
-            pm.get_all_leaf_batches(inputs, masks, game_ids, batch_counts);
+            {
+                // Release GIL so C++ threads can run in parallel
+                py::gil_scoped_release release;
+                pm.get_all_leaf_batches(inputs, masks, game_ids, batch_counts);
+            }
+            // GIL re-acquired here for numpy allocation
 
             int n = (int)inputs.size();
             py::array_t<float> py_inputs;
@@ -202,13 +212,16 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
                                             py::array_t<float> policies,
                                             py::array_t<int> game_ids,
                                             py::array_t<int> batch_counts) {
-            pm.provide_all_evaluations(
-                values.data(),
-                policies.data(),
-                game_ids.data(),
-                batch_counts.data(),
-                (int)game_ids.shape(0)
-            );
+            // Extract raw pointers while GIL is held
+            const float* v_ptr = values.data();
+            const float* p_ptr = policies.data();
+            const int* gid_ptr = game_ids.data();
+            const int* bc_ptr = batch_counts.data();
+            int n_games = (int)game_ids.shape(0);
+
+            // Release GIL so C++ threads can run in parallel
+            py::gil_scoped_release release;
+            pm.provide_all_evaluations(v_ptr, p_ptr, gid_ptr, bc_ptr, n_games);
         })
 
         .def("get_policy_target", [](const ParallelMCTS& pm, int idx, float temperature) {

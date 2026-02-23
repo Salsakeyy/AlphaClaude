@@ -4,6 +4,10 @@
 #include <cstring>
 #include <cmath>
 
+#ifdef HAS_OPENMP
+#include <omp.h>
+#endif
+
 namespace alphaclaude {
 
 MCTS::MCTS(const MCTSConfig& config)
@@ -341,7 +345,64 @@ void ParallelMCTS::get_all_leaf_batches(
     game_ids.clear();
     batch_counts.clear();
 
-    // Reserve estimated capacity to reduce reallocations
+#ifdef HAS_OPENMP
+    // Parallel: each thread collects into local buffers, then merge
+    int num_threads = omp_get_max_threads();
+
+    // Per-thread local storage
+    struct ThreadLocal {
+        std::vector<std::array<float, TOTAL_PLANES * 64>> inputs;
+        std::vector<std::array<float, POLICY_SIZE>> masks;
+        std::vector<int> game_ids;
+        std::vector<int> batch_counts;
+    };
+    std::vector<ThreadLocal> tls(num_threads);
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        auto& local = tls[tid];
+
+        // Per-thread scratch buffers for get_leaf_batch
+        std::vector<std::array<float, TOTAL_PLANES * 64>> tree_inputs;
+        std::vector<std::array<float, POLICY_SIZE>> tree_masks;
+        std::vector<int> tree_terminal_indices;
+        std::vector<float> tree_terminal_values;
+
+        #pragma omp for schedule(dynamic)
+        for (int g = 0; g < num_games_; g++) {
+            if (trees_[g]->search_complete()) continue;
+
+            trees_[g]->get_leaf_batch(tree_inputs, tree_masks,
+                                      tree_terminal_indices, tree_terminal_values);
+
+            int n = (int)tree_inputs.size();
+            if (n > 0) {
+                local.game_ids.push_back(g);
+                local.batch_counts.push_back(n);
+                for (int i = 0; i < n; i++) {
+                    local.inputs.push_back(std::move(tree_inputs[i]));
+                    local.masks.push_back(std::move(tree_masks[i]));
+                }
+            }
+        }
+    }
+
+    // Merge thread-local results (sequential, but fast)
+    int total = 0;
+    for (auto& local : tls) total += (int)local.inputs.size();
+    inputs.reserve(total);
+    masks.reserve(total);
+
+    for (auto& local : tls) {
+        for (auto& gid : local.game_ids) game_ids.push_back(gid);
+        for (auto& bc : local.batch_counts) batch_counts.push_back(bc);
+        for (auto& inp : local.inputs) inputs.push_back(std::move(inp));
+        for (auto& msk : local.masks) masks.push_back(std::move(msk));
+    }
+
+#else
+    // Single-threaded fallback
     int active_count = 0;
     for (int g = 0; g < num_games_; g++) {
         if (!trees_[g]->search_complete()) active_count++;
@@ -351,7 +412,6 @@ void ParallelMCTS::get_all_leaf_batches(
     game_ids.reserve(active_count);
     batch_counts.reserve(active_count);
 
-    // Temporary per-tree buffers (reused to avoid reallocation)
     std::vector<std::array<float, TOTAL_PLANES * 64>> tree_inputs;
     std::vector<std::array<float, POLICY_SIZE>> tree_masks;
     std::vector<int> tree_terminal_indices;
@@ -373,6 +433,7 @@ void ParallelMCTS::get_all_leaf_batches(
             }
         }
     }
+#endif
 }
 
 void ParallelMCTS::provide_all_evaluations(
@@ -382,10 +443,20 @@ void ParallelMCTS::provide_all_evaluations(
     const int* batch_counts,
     int num_games_in_batch)
 {
-    int offset = 0;
+    // Pre-compute offsets so we can parallelize
+    std::vector<int> offsets(num_games_in_batch);
+    offsets[0] = 0;
+    for (int i = 1; i < num_games_in_batch; i++) {
+        offsets[i] = offsets[i - 1] + batch_counts[i - 1];
+    }
+
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(dynamic)
+#endif
     for (int i = 0; i < num_games_in_batch; i++) {
         int g = game_ids[i];
         int count = batch_counts[i];
+        int offset = offsets[i];
 
         std::vector<float> vals(values + offset, values + offset + count);
         std::vector<std::array<float, POLICY_SIZE>> pols(count);
@@ -396,7 +467,6 @@ void ParallelMCTS::provide_all_evaluations(
         }
 
         trees_[g]->provide_evaluations(vals, pols);
-        offset += count;
     }
 }
 
