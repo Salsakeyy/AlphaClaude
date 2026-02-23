@@ -1,0 +1,11 @@
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+*.so
+*.o
+.claude/
+.pytest_cache/
+checkpoints/
+logs/
+perft_test

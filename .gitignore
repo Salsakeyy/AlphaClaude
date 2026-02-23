@@ -1,0 +1,12 @@
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+*.so
+*.o
+*.dylib
+.pytest_cache/
+checkpoints/
+logs/
+perft_test
+.claude/
