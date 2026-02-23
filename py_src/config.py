@@ -4,8 +4,8 @@ from dataclasses import dataclass
 @dataclass
 class AlphaClaudeConfig:
     # Neural network
-    num_res_blocks: int = 10
-    num_filters: int = 128
+    num_res_blocks: int = 20
+    num_filters: int = 256
     input_planes: int = 119
     policy_size: int = 4672
 
@@ -15,7 +15,7 @@ class AlphaClaudeConfig:
     c_init: float = 1.25
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
-    mcts_batch_size: int = 16
+    mcts_batch_size: int = 64
 
     # Temperature
     temp_threshold: int = 30  # moves before switching to tau->0
@@ -24,7 +24,7 @@ class AlphaClaudeConfig:
 
     # Self-play
     num_self_play_games: int = 100
-    num_parallel_games: int = 64
+    num_parallel_games: int = 256
     max_game_length: int = 512
 
     # Training
