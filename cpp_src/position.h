@@ -70,6 +70,15 @@ public:
     // Move from UCI string
     Move parse_uci(const std::string& uci) const;
 
+    // Fix st_ after move construction/assignment.
+    // After a move, st_ may point to the old object's root_si_.
+    // Call this with the OLD (moved-from) object to redirect st_ if needed.
+    void fix_st_after_move(const Position& old_pos) {
+        if (st_ == &old_pos.root_si_) {
+            st_ = &root_si_;
+        }
+    }
+
 private:
     void put_piece(Piece p, Square s);
     void remove_piece(Square s);

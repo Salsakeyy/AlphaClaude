@@ -37,8 +37,8 @@ public:
     GameState(const std::string& fen);
     GameState(const GameState& other);
     GameState& operator=(const GameState& other);
-    GameState(GameState&&) = default;
-    GameState& operator=(GameState&&) = default;
+    GameState(GameState&& other) noexcept;
+    GameState& operator=(GameState&& other) noexcept;
 
     // Core operations
     void reset();

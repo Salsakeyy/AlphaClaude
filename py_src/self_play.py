@@ -107,19 +107,19 @@ def _finalize_trajectory(trajectory, game):
 
 
 class _GameSlot:
-    """State for one concurrent game in parallel self-play."""
-    __slots__ = ('game', 'mcts', 'trajectory', 'move_num', 'search_active')
+    """Lightweight Python-side state for one concurrent game."""
+    __slots__ = ('game', 'trajectory', 'move_num', 'active')
 
-    def __init__(self, mcts_config):
+    def __init__(self):
         self.game = ac.GameState()
-        self.mcts = ac.MCTS(mcts_config)
         self.trajectory = []
         self.move_num = 0
-        self.search_active = False
+        self.active = True
 
 
 class ParallelSelfPlay:
-    """Runs N games concurrently, batching NN inference across all active searches."""
+    """Runs N games concurrently, batching NN inference across all active searches.
+    Uses C++ ParallelMCTS to eliminate the Python loop over trees."""
 
     def __init__(self, model: AlphaZeroNet, config: AlphaClaudeConfig, device: torch.device):
         self.model = model
@@ -145,44 +145,31 @@ class ParallelSelfPlay:
         mcts_config = self._make_mcts_config()
         n_parallel = min(self.config.num_parallel_games, num_games)
 
-        # Initialize game slots
-        slots = [_GameSlot(mcts_config) for _ in range(n_parallel)]
-        for s in slots:
-            s.mcts.new_search(s.game)
-            s.search_active = True
+        # C++ side: one ParallelMCTS manages all trees
+        pmcts = ac.ParallelMCTS(mcts_config, n_parallel)
+
+        # Python side: lightweight game state + trajectory tracking
+        slots = [_GameSlot() for _ in range(n_parallel)]
+        for i, s in enumerate(slots):
+            pmcts.new_search(i, s.game)
 
         all_examples = []
         games_started = n_parallel
         games_completed = 0
 
         while games_completed < num_games:
-            # --- Gather leaf batches from all active searches ---
-            slot_inputs = []     # list of (slot_idx, inputs_np, masks_np)
-            all_inputs_list = []
-            all_masks_list = []
+            # --- ONE C++ call gathers leaves from ALL trees ---
+            inputs, masks, game_ids, batch_counts = pmcts.get_all_leaf_batches()
+            n = inputs.shape[0]
 
-            for idx, slot in enumerate(slots):
-                if not slot.search_active:
-                    continue
-                inputs, masks, terminal_indices, terminal_values = slot.mcts.get_leaf_batch()
-                n = inputs.shape[0]
-                if n > 0:
-                    slot_inputs.append((idx, n))
-                    all_inputs_list.append(inputs)
-                    all_masks_list.append(masks)
-
-            # --- Batched NN inference ---
-            if all_inputs_list:
-                all_inp = np.concatenate(all_inputs_list, axis=0)
-                all_msk = np.concatenate(all_masks_list, axis=0)
-
-                inp_tensor = torch.from_numpy(all_inp).to(self.device)
-                mask_tensor = torch.from_numpy(all_msk).to(self.device)
+            # --- ONE GPU call for all leaves ---
+            if n > 0:
+                inp_tensor = torch.from_numpy(inputs).to(self.device)
+                mask_tensor = torch.from_numpy(masks).to(self.device)
 
                 if self.use_amp:
                     with torch.amp.autocast('cuda'):
                         policy_logits, values = self.model(inp_tensor)
-                    # Cast back to float32 for numpy conversion
                     policy_logits = policy_logits.float()
                     values = values.float()
                 else:
@@ -190,63 +177,59 @@ class ParallelSelfPlay:
 
                 policy_logits = policy_logits.masked_fill(mask_tensor == 0, -1e9)
 
-                all_values_np = values.squeeze(-1).cpu().numpy()
-                all_policy_np = policy_logits.cpu().numpy()
+                values_np = values.squeeze(-1).cpu().numpy()
+                policy_np = policy_logits.cpu().numpy()
 
-                # --- Distribute results back to each game's MCTS ---
-                offset = 0
-                for slot_idx, count in slot_inputs:
-                    slot = slots[slot_idx]
-                    slot.mcts.provide_evaluations(
-                        all_values_np[offset:offset + count],
-                        all_policy_np[offset:offset + count],
-                    )
-                    offset += count
+                # --- ONE C++ call distributes results to all trees ---
+                pmcts.provide_all_evaluations(
+                    values_np, policy_np, game_ids, batch_counts
+                )
 
-            # --- Handle completed searches: record data, make moves ---
-            for slot in slots:
-                if not slot.search_active:
+            # --- Handle completed searches (lightweight Python) ---
+            for i in range(n_parallel):
+                if not slots[i].active:
+                    continue
+                if not pmcts.search_complete(i):
                     continue
 
-                if slot.mcts.search_complete():
-                    # Record training data for this position
-                    temp = (self.config.temperature
-                            if slot.move_num < self.config.temp_threshold
-                            else self.config.temperature_final)
-                    nn_input = slot.game.get_nn_input()
-                    policy_target = slot.mcts.get_policy_target(temp)
-                    slot.trajectory.append((nn_input, policy_target, slot.game.side_to_move()))
+                slot = slots[i]
+                temp = (self.config.temperature
+                        if slot.move_num < self.config.temp_threshold
+                        else self.config.temperature_final)
 
-                    # Play the move
-                    move_uci = slot.mcts.select_move_uci(temp)
-                    slot.game.make_move_uci(move_uci)
-                    slot.move_num += 1
+                # Record training data
+                nn_input = slot.game.get_nn_input()
+                policy_target = pmcts.get_policy_target(i, temp)
+                slot.trajectory.append((nn_input, policy_target, slot.game.side_to_move()))
 
-                    # Check if game is over
-                    if slot.game.is_terminal() or slot.move_num >= self.config.max_game_length:
-                        # Finalize this game
-                        examples = _finalize_trajectory(slot.trajectory, slot.game)
-                        all_examples.extend(examples)
-                        games_completed += 1
+                # Play the move
+                move_uci = pmcts.select_move_uci(i, temp)
+                slot.game.make_move_uci(move_uci)
+                slot.move_num += 1
 
-                        if (games_completed) % 10 == 0:
-                            print(f"  Self-play: {games_completed}/{num_games} games, "
-                                  f"{len(all_examples)} examples")
+                # Check if game is over
+                if slot.game.is_terminal() or slot.move_num >= self.config.max_game_length:
+                    examples = _finalize_trajectory(slot.trajectory, slot.game)
+                    all_examples.extend(examples)
+                    games_completed += 1
 
-                        # Reuse slot for a new game if more games needed
-                        if games_started < num_games:
-                            slot.game = ac.GameState()
-                            slot.mcts = ac.MCTS(mcts_config)
-                            slot.trajectory = []
-                            slot.move_num = 0
-                            slot.mcts.new_search(slot.game)
-                            slot.search_active = True
-                            games_started += 1
-                        else:
-                            slot.search_active = False
+                    if games_completed % 10 == 0:
+                        print(f"  Self-play: {games_completed}/{num_games} games, "
+                              f"{len(all_examples)} examples")
+
+                    # Reuse slot for a new game
+                    if games_started < num_games:
+                        slot.game = ac.GameState()
+                        slot.trajectory = []
+                        slot.move_num = 0
+                        pmcts.reset_game(i)
+                        pmcts.new_search(i, slot.game)
+                        games_started += 1
                     else:
-                        # Start next search for this game
-                        slot.mcts.new_search(slot.game)
+                        slot.active = False
+                else:
+                    # Start next search for this game
+                    pmcts.new_search(i, slot.game)
 
         return all_examples
 

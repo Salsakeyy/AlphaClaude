@@ -310,4 +310,106 @@ float MCTS::root_value() const {
     return root_->q_value();
 }
 
+// ============================================================
+// ParallelMCTS implementation
+// ============================================================
+
+ParallelMCTS::ParallelMCTS(const MCTSConfig& config, int num_games)
+    : config_(config), num_games_(num_games) {
+    trees_.reserve(num_games);
+    for (int i = 0; i < num_games; i++) {
+        trees_.push_back(std::make_unique<MCTS>(config));
+    }
+}
+
+void ParallelMCTS::new_search(int game_idx, const GameState& gs) {
+    trees_[game_idx]->new_search(gs);
+}
+
+bool ParallelMCTS::search_complete(int game_idx) const {
+    return trees_[game_idx]->search_complete();
+}
+
+void ParallelMCTS::get_all_leaf_batches(
+    std::vector<std::array<float, TOTAL_PLANES * 64>>& inputs,
+    std::vector<std::array<float, POLICY_SIZE>>& masks,
+    std::vector<int>& game_ids,
+    std::vector<int>& batch_counts)
+{
+    inputs.clear();
+    masks.clear();
+    game_ids.clear();
+    batch_counts.clear();
+
+    // Reserve estimated capacity to reduce reallocations
+    int active_count = 0;
+    for (int g = 0; g < num_games_; g++) {
+        if (!trees_[g]->search_complete()) active_count++;
+    }
+    inputs.reserve(active_count * config_.batch_size);
+    masks.reserve(active_count * config_.batch_size);
+    game_ids.reserve(active_count);
+    batch_counts.reserve(active_count);
+
+    // Temporary per-tree buffers (reused to avoid reallocation)
+    std::vector<std::array<float, TOTAL_PLANES * 64>> tree_inputs;
+    std::vector<std::array<float, POLICY_SIZE>> tree_masks;
+    std::vector<int> tree_terminal_indices;
+    std::vector<float> tree_terminal_values;
+
+    for (int g = 0; g < num_games_; g++) {
+        if (trees_[g]->search_complete()) continue;
+
+        trees_[g]->get_leaf_batch(tree_inputs, tree_masks,
+                                  tree_terminal_indices, tree_terminal_values);
+
+        int n = (int)tree_inputs.size();
+        if (n > 0) {
+            game_ids.push_back(g);
+            batch_counts.push_back(n);
+            for (int i = 0; i < n; i++) {
+                inputs.push_back(std::move(tree_inputs[i]));
+                masks.push_back(std::move(tree_masks[i]));
+            }
+        }
+    }
+}
+
+void ParallelMCTS::provide_all_evaluations(
+    const float* values,
+    const float* policies,
+    const int* game_ids,
+    const int* batch_counts,
+    int num_games_in_batch)
+{
+    int offset = 0;
+    for (int i = 0; i < num_games_in_batch; i++) {
+        int g = game_ids[i];
+        int count = batch_counts[i];
+
+        std::vector<float> vals(values + offset, values + offset + count);
+        std::vector<std::array<float, POLICY_SIZE>> pols(count);
+        for (int j = 0; j < count; j++) {
+            std::memcpy(pols[j].data(),
+                        policies + (offset + j) * POLICY_SIZE,
+                        POLICY_SIZE * sizeof(float));
+        }
+
+        trees_[g]->provide_evaluations(vals, pols);
+        offset += count;
+    }
+}
+
+void ParallelMCTS::get_policy_target(int game_idx, float* output, float temperature) const {
+    trees_[game_idx]->get_policy_target(output, temperature);
+}
+
+Move ParallelMCTS::select_move(int game_idx, float temperature) const {
+    return trees_[game_idx]->select_move(temperature);
+}
+
+void ParallelMCTS::reset_game(int game_idx) {
+    trees_[game_idx] = std::make_unique<MCTS>(config_);
+}
+
 } // namespace alphaclaude

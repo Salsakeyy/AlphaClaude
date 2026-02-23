@@ -145,6 +145,87 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
         .def("simulations_done", &MCTS::simulations_done);
 
     // ============================================================
+    // ParallelMCTS
+    // ============================================================
+    py::class_<ParallelMCTS>(m, "ParallelMCTS")
+        .def(py::init<const MCTSConfig&, int>())
+
+        .def("new_search", [](ParallelMCTS& pm, int idx, const GameState& gs) {
+            pm.new_search(idx, gs);
+        })
+
+        .def("search_complete", &ParallelMCTS::search_complete)
+        .def("num_games", &ParallelMCTS::num_games)
+
+        .def("get_all_leaf_batches", [](ParallelMCTS& pm) {
+            std::vector<std::array<float, TOTAL_PLANES * 64>> inputs;
+            std::vector<std::array<float, POLICY_SIZE>> masks;
+            std::vector<int> game_ids;
+            std::vector<int> batch_counts;
+
+            pm.get_all_leaf_batches(inputs, masks, game_ids, batch_counts);
+
+            int n = (int)inputs.size();
+            py::array_t<float> py_inputs;
+            py::array_t<float> py_masks;
+
+            if (n > 0) {
+                py_inputs = py::array_t<float>(std::vector<ssize_t>{n, TOTAL_PLANES, 8, 8});
+                py_masks = py::array_t<float>(std::vector<ssize_t>{n, (ssize_t)POLICY_SIZE});
+                auto inp_buf = py_inputs.mutable_data();
+                auto mask_buf = py_masks.mutable_data();
+                for (int i = 0; i < n; i++) {
+                    std::memcpy(inp_buf + i * TOTAL_PLANES * 64,
+                                inputs[i].data(), TOTAL_PLANES * 64 * sizeof(float));
+                    std::memcpy(mask_buf + i * POLICY_SIZE,
+                                masks[i].data(), POLICY_SIZE * sizeof(float));
+                }
+            } else {
+                py_inputs = py::array_t<float>(std::vector<ssize_t>{0, TOTAL_PLANES, 8, 8});
+                py_masks = py::array_t<float>(std::vector<ssize_t>{0, (ssize_t)POLICY_SIZE});
+            }
+
+            py::array_t<int> py_game_ids(game_ids.size());
+            py::array_t<int> py_batch_counts(batch_counts.size());
+            if (!game_ids.empty()) {
+                std::memcpy(py_game_ids.mutable_data(), game_ids.data(),
+                            game_ids.size() * sizeof(int));
+                std::memcpy(py_batch_counts.mutable_data(), batch_counts.data(),
+                            batch_counts.size() * sizeof(int));
+            }
+
+            return py::make_tuple(py_inputs, py_masks, py_game_ids, py_batch_counts);
+        })
+
+        .def("provide_all_evaluations", [](ParallelMCTS& pm,
+                                            py::array_t<float> values,
+                                            py::array_t<float> policies,
+                                            py::array_t<int> game_ids,
+                                            py::array_t<int> batch_counts) {
+            pm.provide_all_evaluations(
+                values.data(),
+                policies.data(),
+                game_ids.data(),
+                batch_counts.data(),
+                (int)game_ids.shape(0)
+            );
+        })
+
+        .def("get_policy_target", [](const ParallelMCTS& pm, int idx, float temperature) {
+            py::array_t<float> arr(std::vector<ssize_t>{POLICY_SIZE});
+            auto buf = arr.mutable_data();
+            pm.get_policy_target(idx, buf, temperature);
+            return arr;
+        })
+
+        .def("select_move_uci", [](const ParallelMCTS& pm, int idx, float temperature) {
+            Move m = pm.select_move(idx, temperature);
+            return m.to_uci();
+        })
+
+        .def("reset_game", &ParallelMCTS::reset_game);
+
+    // ============================================================
     // Constants
     // ============================================================
     m.attr("TOTAL_PLANES") = TOTAL_PLANES;

@@ -108,4 +108,52 @@ private:
     std::mt19937 rng_;
 };
 
+// ============================================================
+// ParallelMCTS – multi-tree coordinator (eliminates Python loop)
+// ============================================================
+
+class ParallelMCTS {
+public:
+    ParallelMCTS(const MCTSConfig& config, int num_games);
+
+    // Start a new search for game i
+    void new_search(int game_idx, const GameState& gs);
+
+    // Is game i's search complete?
+    bool search_complete(int game_idx) const;
+
+    // THE KEY METHOD: gather leaves from ALL active games in one C++ call.
+    // Appends to outputs; caller should clear before calling.
+    void get_all_leaf_batches(
+        std::vector<std::array<float, TOTAL_PLANES * 64>>& inputs,
+        std::vector<std::array<float, POLICY_SIZE>>& masks,
+        std::vector<int>& game_ids,      // which game each input belongs to
+        std::vector<int>& batch_counts    // how many NN inputs per game
+    );
+
+    // Distribute NN results back to all games in one call.
+    // game_ids and batch_counts must match the output of get_all_leaf_batches.
+    void provide_all_evaluations(
+        const float* values,
+        const float* policies,  // row-major [N, POLICY_SIZE]
+        const int* game_ids,
+        const int* batch_counts,
+        int num_games_in_batch
+    );
+
+    // Per-game accessors
+    void get_policy_target(int game_idx, float* output, float temperature) const;
+    Move select_move(int game_idx, float temperature) const;
+
+    // Reset game slot with fresh GameState
+    void reset_game(int game_idx);
+
+    int num_games() const { return num_games_; }
+
+private:
+    MCTSConfig config_;
+    std::vector<std::unique_ptr<MCTS>> trees_;
+    int num_games_;
+};
+
 } // namespace alphaclaude

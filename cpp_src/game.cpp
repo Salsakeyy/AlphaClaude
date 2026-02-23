@@ -194,6 +194,32 @@ GameState& GameState::operator=(const GameState& other) {
     return *this;
 }
 
+GameState::GameState(GameState&& other) noexcept
+    : pos_(std::move(other.pos_)),
+      state_history_(std::move(other.state_history_)),
+      board_history_(std::move(other.board_history_)),
+      fen_history_(std::move(other.fen_history_)),
+      move_history_(std::move(other.move_history_)),
+      move_count_(other.move_count_)
+{
+    // Fix st_ pointer: if it was pointing at other's root_si_, redirect to ours
+    pos_.fix_st_after_move(other.pos_);
+}
+
+GameState& GameState::operator=(GameState&& other) noexcept {
+    if (this != &other) {
+        pos_ = std::move(other.pos_);
+        state_history_ = std::move(other.state_history_);
+        board_history_ = std::move(other.board_history_);
+        fen_history_ = std::move(other.fen_history_);
+        move_history_ = std::move(other.move_history_);
+        move_count_ = other.move_count_;
+        // Fix st_ pointer: if it was pointing at other's root_si_, redirect to ours
+        pos_.fix_st_after_move(other.pos_);
+    }
+    return *this;
+}
+
 void GameState::reset() {
     pos_.set_startpos();
     state_history_.clear();
