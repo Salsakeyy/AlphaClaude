@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
+import time
 
 import alphaclaude_cpp as ac
 from .config import AlphaClaudeConfig
@@ -156,17 +157,32 @@ class ParallelSelfPlay:
         all_examples = []
         games_started = n_parallel
         games_completed = 0
+        start_time = time.perf_counter()
+        gather_time = 0.0
+        infer_time = 0.0
+        provide_time = 0.0
+        infer_calls = 0
+        total_leaf_evals = 0
+        max_leaf_batch = 0
 
         while games_completed < num_games:
             # --- ONE C++ call gathers leaves from ALL trees ---
+            t0 = time.perf_counter()
             inputs, masks, game_ids, batch_counts = pmcts.get_all_leaf_batches()
+            gather_time += time.perf_counter() - t0
             n = inputs.shape[0]
 
             # --- ONE GPU call for all leaves ---
             if n > 0:
-                inp_tensor = torch.from_numpy(inputs).to(self.device)
-                mask_tensor = torch.from_numpy(masks).to(self.device)
+                total_leaf_evals += int(n)
+                infer_calls += 1
+                if n > max_leaf_batch:
+                    max_leaf_batch = int(n)
 
+                inp_tensor = torch.from_numpy(inputs).to(self.device, non_blocking=True)
+                mask_tensor = torch.from_numpy(masks).to(self.device, non_blocking=True)
+
+                t1 = time.perf_counter()
                 if self.use_amp:
                     with torch.amp.autocast('cuda'):
                         policy_logits, values = self.model(inp_tensor)
@@ -179,11 +195,14 @@ class ParallelSelfPlay:
 
                 values_np = values.squeeze(-1).cpu().numpy()
                 policy_np = policy_logits.cpu().numpy()
+                infer_time += time.perf_counter() - t1
 
                 # --- ONE C++ call distributes results to all trees ---
+                t2 = time.perf_counter()
                 pmcts.provide_all_evaluations(
                     values_np, policy_np, game_ids, batch_counts
                 )
+                provide_time += time.perf_counter() - t2
 
             # --- Handle completed searches (lightweight Python) ---
             for i in range(n_parallel):
@@ -230,6 +249,21 @@ class ParallelSelfPlay:
                 else:
                     # Start next search for this game
                     pmcts.new_search(i, slot.game)
+
+        if self.config.log_perf:
+            total_time = time.perf_counter() - start_time
+            examples_per_sec = len(all_examples) / total_time if total_time > 0 else 0.0
+            games_per_sec = num_games / total_time if total_time > 0 else 0.0
+            avg_leaf_batch = total_leaf_evals / infer_calls if infer_calls > 0 else 0.0
+            infer_share = 100.0 * infer_time / total_time if total_time > 0 else 0.0
+            gather_share = 100.0 * gather_time / total_time if total_time > 0 else 0.0
+            provide_share = 100.0 * provide_time / total_time if total_time > 0 else 0.0
+            print("  Self-play perf: "
+                  f"{games_per_sec:.2f} games/s, {examples_per_sec:.1f} ex/s, "
+                  f"infer_calls={infer_calls}, avg_leaf_batch={avg_leaf_batch:.1f}, "
+                  f"max_leaf_batch={max_leaf_batch}, "
+                  f"t_get={gather_share:.1f}%, t_nn={infer_share:.1f}%, "
+                  f"t_provide={provide_share:.1f}%")
 
         return all_examples
 

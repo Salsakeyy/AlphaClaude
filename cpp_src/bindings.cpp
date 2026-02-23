@@ -243,4 +243,9 @@ PYBIND11_MODULE(alphaclaude_cpp, m) {
     // ============================================================
     m.attr("TOTAL_PLANES") = TOTAL_PLANES;
     m.attr("POLICY_SIZE") = POLICY_SIZE;
+#ifdef HAS_OPENMP
+    m.attr("HAS_OPENMP") = true;
+#else
+    m.attr("HAS_OPENMP") = false;
+#endif
 }

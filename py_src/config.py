@@ -43,6 +43,11 @@ class AlphaClaudeConfig:
     arena_games: int = 40
     arena_threshold: float = 0.55  # win rate to accept new model
 
+    # Performance / system behavior
+    use_amp: bool = True
+    use_tf32: bool = True
+    log_perf: bool = True
+
     # System
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"

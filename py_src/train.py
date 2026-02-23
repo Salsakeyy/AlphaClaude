@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,7 +43,28 @@ class Trainer:
         self.device = get_device()
         print(f"Using device: {self.device}")
 
+        self.use_amp = bool(self.config.use_amp and self.device.type == "cuda")
+        self.autocast_device = "cuda" if self.device.type == "cuda" else "cpu"
+        if self.device.type == "cuda":
+            if self.config.use_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                try:
+                    torch.set_float32_matmul_precision("high")
+                except Exception:
+                    pass
+            torch.backends.cudnn.benchmark = True
+        print(f"AMP training: {self.use_amp}")
+        if self.device.type == "cuda":
+            print(f"TF32: {bool(self.config.use_tf32)}")
+
         self.model = AlphaZeroNet(self.config).to(self.device)
+        self.scaler = None
+        if self.use_amp:
+            try:
+                self.scaler = torch.amp.GradScaler("cuda")
+            except AttributeError:
+                self.scaler = torch.cuda.amp.GradScaler()
         self.optimizer = torch.optim.SGD(
             self.model.parameters(),
             lr=self.config.learning_rate,
@@ -66,27 +88,33 @@ class Trainer:
 
         self.model.train()
         inputs, target_policies, target_values = self.replay_buffer.sample(batch_size)
-        inputs = inputs.to(self.device)
-        target_policies = target_policies.to(self.device)
-        target_values = target_values.to(self.device)
+        inputs = inputs.to(self.device, non_blocking=True)
+        target_policies = target_policies.to(self.device, non_blocking=True)
+        target_values = target_values.to(self.device, non_blocking=True)
 
-        # Forward
-        policy_logits, pred_values = self.model(inputs)
-        pred_values = pred_values.squeeze(-1)
+        with torch.amp.autocast(self.autocast_device, enabled=self.use_amp):
+            # Forward
+            policy_logits, pred_values = self.model(inputs)
+            pred_values = pred_values.squeeze(-1)
 
-        # Value loss: MSE
-        value_loss = F.mse_loss(pred_values, target_values)
+            # Value loss: MSE
+            value_loss = F.mse_loss(pred_values, target_values)
 
-        # Policy loss: cross-entropy with target distribution
-        log_probs = F.log_softmax(policy_logits, dim=1)
-        policy_loss = -torch.sum(target_policies * log_probs, dim=1).mean()
+            # Policy loss: cross-entropy with target distribution
+            log_probs = F.log_softmax(policy_logits, dim=1)
+            policy_loss = -torch.sum(target_policies * log_probs, dim=1).mean()
 
-        # Total loss
-        loss = value_loss + policy_loss
+            # Total loss
+            loss = value_loss + policy_loss
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
 
         return {
             "loss": loss.item(),
@@ -149,42 +177,51 @@ class Trainer:
 
         for iteration in range(self.iteration, self.config.num_iterations):
             self.iteration = iteration
+            iter_start = time.perf_counter()
             print(f"\n{'='*60}")
             print(f"Iteration {iteration + 1}/{self.config.num_iterations}")
             print(f"{'='*60}")
 
             # Self-play phase
             print("\n--- Self-Play ---")
+            self_play_start = time.perf_counter()
             examples = run_self_play(
                 self.model, self.config, self.device,
                 num_games=self.config.num_self_play_games,
             )
+            self_play_time = time.perf_counter() - self_play_start
             self.replay_buffer.add(examples)
             print(f"Generated {len(examples)} examples, buffer size: {len(self.replay_buffer)}")
 
             # Training phase
+            train_time = 0.0
             if len(self.replay_buffer) >= self.config.min_replay_size:
                 print("\n--- Training ---")
                 # Save model before training for comparison
                 prev_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
+                train_start = time.perf_counter()
                 for epoch in range(self.config.num_epochs):
                     result = self.train_epoch()
                     if result:
                         print(f"  Epoch {epoch+1}: loss={result['loss']:.4f} "
                               f"(v={result['value_loss']:.4f}, p={result['policy_loss']:.4f}), "
                               f"steps={result['steps']}")
+                train_time = time.perf_counter() - train_start
 
                 # Arena evaluation
+                arena_time = 0.0
                 if self.config.arena_games > 0 and iteration > 0:
                     print("\n--- Arena ---")
                     old_model = AlphaZeroNet(self.config).to(self.device)
                     old_model.load_state_dict(prev_state)
 
+                    arena_start = time.perf_counter()
                     win_rate = pit(
                         self.model, old_model, self.config, self.device,
                         num_games=self.config.arena_games,
                     )
+                    arena_time = time.perf_counter() - arena_start
                     print(f"  New model win rate: {win_rate:.2%}")
 
                     if win_rate < self.config.arena_threshold:
@@ -192,11 +229,24 @@ class Trainer:
                         self.model.load_state_dict(prev_state)
                     else:
                         print("  Accepting new model!")
+            else:
+                arena_time = 0.0
 
             # Save checkpoint
             ckpt_path = os.path.join(self.config.checkpoint_dir, f"model_{iteration:04d}.pt")
             self.save_checkpoint(ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
+
+            if self.config.log_perf:
+                iter_total = time.perf_counter() - iter_start
+                sp_pct = 100.0 * self_play_time / iter_total if iter_total > 0 else 0.0
+                tr_pct = 100.0 * train_time / iter_total if iter_total > 0 else 0.0
+                ar_pct = 100.0 * arena_time / iter_total if iter_total > 0 else 0.0
+                print("Iteration timing: "
+                      f"self-play={self_play_time:.1f}s ({sp_pct:.1f}%), "
+                      f"train={train_time:.1f}s ({tr_pct:.1f}%), "
+                      f"arena={arena_time:.1f}s ({ar_pct:.1f}%), "
+                      f"total={iter_total:.1f}s")
 
         print("\nTraining complete!")
 
